@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Interactive, resumable Laravel project setup for this server.
-# Usage: bash new-project.sh
+# quicklaraserver
+# Usage: bash quicklaraserver.sh
 #
 # Progress is saved in ~/.project-setup/<name>/ :
 #   config        saved answers (reused on re-run)
@@ -12,7 +13,14 @@ WEBROOT="/var/www/html"
 NGINX_AVAIL="/etc/nginx/sites-available"
 NGINX_ENABLED="/etc/nginx/sites-enabled"
 STATE_ROOT="$HOME/.project-setup"
+PHP_VER="${PHP_VER:-8.3}"        # override: PHP_VER=8.4 quicklaraserver
+NODE_MAJOR="${NODE_MAJOR:-22}"   # override: NODE_MAJOR=20 quicklaraserver
 STAGE_OK=1
+
+# Allow running as root on minimal servers that have no sudo installed
+if ! command -v sudo >/dev/null 2>&1; then
+  if [[ $EUID -eq 0 ]]; then sudo() { "$@"; }; else echo "sudo is required"; exit 1; fi
+fi
 
 step()  { echo -e "\n\033[1;36m==> $*\033[0m"; }
 pause() { read -rp "Press Enter to continue (Ctrl+C to abort)... " _; }
@@ -71,7 +79,7 @@ else
   ask DOMAIN      "Domain (e.g. app.example.com)"
   ask ENV_SRC     "Copy .env from which project dir ('' to use .env.example)" "washway"
   ask NGINX_NAME  "Shared nginx site file in $NGINX_AVAIL" "mywill"
-  ask PHP_SOCK    "PHP-FPM socket" "/run/php/php8.3-fpm.sock"
+  ask PHP_SOCK    "PHP-FPM socket" "/run/php/php${PHP_VER}-fpm.sock"
 
   # Accept owner/repo, git@github.com:owner/repo(.git) or https://github.com/owner/repo(.git)
   REPO=$(echo "$REPO" | sed -E 's#^(git@github\.com:|https?://github\.com/)##; s#\.git/?$##; s#/$##')
@@ -101,6 +109,108 @@ pause
 s_apt() {
   run sudo apt update
   run sudo apt upgrade -y
+}
+
+s_prereqs() {
+  echo "Checking prerequisites (Ubuntu/Debian)..."
+  run sudo apt-get install -y curl git unzip ca-certificates gnupg software-properties-common lsb-release
+
+  # PHP + extensions Laravel needs
+  local e pkgs=()
+  for e in cli fpm mysql mbstring xml curl zip bcmath intl gd; do
+    dpkg -s "php$PHP_VER-$e" >/dev/null 2>&1 || pkgs+=("php$PHP_VER-$e")
+  done
+  if (( ${#pkgs[@]} )); then
+    echo "PHP $PHP_VER missing packages: ${pkgs[*]}"
+    if ! apt-cache policy "php$PHP_VER-fpm" | grep -q 'Candidate: [0-9]'; then
+      echo "PHP $PHP_VER not in default repos, adding ondrej/php PPA"
+      run sudo add-apt-repository -y ppa:ondrej/php
+      run sudo apt-get update
+    fi
+    run sudo apt-get install -y "${pkgs[@]}"
+  else
+    echo "PHP $PHP_VER and extensions: OK"
+  fi
+  run sudo systemctl enable --now "php$PHP_VER-fpm"
+
+  # Composer (official installer, checksum verified)
+  if command -v composer >/dev/null; then
+    echo "Composer: OK"
+  else
+    echo "Composer missing, installing"
+    local expected actual
+    expected=$(curl -fsSL https://composer.github.io/installer.sig)
+    curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php
+    actual=$(php -r "echo hash_file('sha384','/tmp/composer-setup.php');")
+    if [[ -n $expected && $expected == "$actual" ]]; then
+      run sudo php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+    else
+      echo "Composer installer checksum mismatch, aborting"; rm -f /tmp/composer-setup.php; exit 1
+    fi
+    rm -f /tmp/composer-setup.php
+  fi
+
+  # Node.js (NodeSource) needs v18+
+  local nmajor=0
+  command -v node >/dev/null && nmajor=$(node -p 'process.versions.node.split(".")[0]')
+  if (( nmajor >= 18 )) && command -v npm >/dev/null; then
+    echo "Node: OK (v$(node -v | tr -d v))"
+  else
+    echo "Node missing or too old, installing Node $NODE_MAJOR"
+    run bash -c "curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash -"
+    run sudo apt-get install -y nodejs
+  fi
+
+  # Nginx
+  if command -v nginx >/dev/null; then echo "Nginx: OK"; else run sudo apt-get install -y nginx; fi
+  run sudo systemctl enable --now nginx
+
+  # MySQL (also satisfied by an existing MariaDB)
+  if command -v mysql >/dev/null; then
+    echo "MySQL client/server: OK"
+  else
+    run sudo apt-get install -y mysql-server
+  fi
+  sudo systemctl enable --now mysql 2>/dev/null || sudo systemctl enable --now mariadb 2>/dev/null || true
+
+  # Certbot and Supervisor
+  command -v certbot >/dev/null || run sudo apt-get install -y certbot python3-certbot-nginx
+  command -v supervisorctl >/dev/null || run sudo apt-get install -y supervisor
+
+  echo -e "\nVersions:"
+  php -v | head -1
+  composer --version 2>/dev/null | head -1
+  echo "node $(node -v), npm $(npm -v)"
+  nginx -v 2>&1
+  mysql --version
+}
+
+s_database() {
+  local yn sql
+  read -rp "Create a MySQL database and user for '$NAME' now? [Y/n] " yn
+  if [[ ${yn:-y} =~ ^[Nn]$ ]]; then
+    echo "Skipping. Create the database yourself before the migrate stage."
+    return
+  fi
+  ask DB_NAME "Database name" "${NAME//-/_}"
+  ask DB_USER "Database user" "${NAME//-/_}"
+  read -rsp "Database password (not saved anywhere): " DB_PASS; echo
+  [[ $DB_NAME =~ ^[A-Za-z0-9_]+$ && $DB_USER =~ ^[A-Za-z0-9_]+$ ]] || { echo "Names: letters, numbers, _ only"; STAGE_OK=0; return; }
+  [[ -n $DB_PASS && $DB_PASS != *"'"* && $DB_PASS != *'\'* ]] || { echo "Password must be non-empty with no ' or \\"; STAGE_OK=0; return; }
+
+  sql="CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
+FLUSH PRIVILEGES;"
+  if printf '%s\n' "$sql" | sudo mysql; then
+    echo -e "\nIf the user already existed, its password was left unchanged."
+    echo "Use these in .env:"
+    echo "  DB_CONNECTION=mysql  DB_HOST=127.0.0.1  DB_PORT=3306"
+    echo "  DB_DATABASE=$DB_NAME  DB_USERNAME=$DB_USER  DB_PASSWORD=<what you typed>"
+    pause
+  else
+    echo "MySQL command failed."; STAGE_OK=0
+  fi
 }
 
 s_sshkey() {
@@ -169,7 +279,10 @@ s_perms()       { run sudo chown -R www-data:www-data "$APP/storage" "$APP/boots
 s_build()       { cd "$APP" || exit 1; run npm run build; }
 
 s_nginx() {
-  [[ -f $NGINX_FILE ]] || { echo "Missing $NGINX_FILE"; exit 1; }
+  if [[ ! -f $NGINX_FILE ]]; then
+    echo "$NGINX_FILE not found, creating it (fresh server)."
+    echo "# Shared site config for Laravel projects" | sudo tee "$NGINX_FILE" >/dev/null
+  fi
 
   if sudo grep -q "server_name $DOMAIN;" "$NGINX_FILE"; then
     echo "$DOMAIN already in $NGINX_FILE, skipping append."
@@ -266,10 +379,12 @@ s_finalenv() {
 }
 
 stage apt         "System update"                 s_apt
+stage prereqs     "Prerequisites (PHP, Composer, Node, Nginx, MySQL)" s_prereqs
 stage sshkey      "SSH key, config, authorized_keys" s_sshkey
 stage clone       "Clone repo"                    s_clone
 stage composer    "composer install"              s_composer
 stage npm         "npm install"                   s_npm
+stage database    "MySQL database and user"       s_database
 stage env         ".env setup"                    s_env
 stage keygen      "artisan key:generate"          s_keygen
 stage migrate     "artisan migrate"               s_migrate
